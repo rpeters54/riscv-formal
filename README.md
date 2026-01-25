@@ -2,7 +2,26 @@
 RISC-V Formal Verification Framework
 ====================================
 
-**This is work in progress. The interfaces described here are likely to change as the project matures.**
+This Fork
+---------
+
+This version of the riscv-formal repo contains the verification infrastructure for the [OtterMCU](https://github.com/rpeters54/OtterMCU) and [StoatMCU](https://github.com/rpeters54/StoatMCU).
+
+This module includes an updated version of the `genchecks.py` build script for generating the checks that fixes up some of the weird path handling.
+
+To build each core and run checks:
+```bash
+# Enter the cores directory
+cd cores
+
+# Generate the checks directory for the DUT
+./genchecks.py --corename stoat --cfgname checks --basedir ~/riscv-formal
+
+# Run the checks on that core
+# Note: replace (nprocs) with the number of parallel sby tasks to run at a time
+cd stoat
+make -C checks -j(nprocs)
+```
 
 About
 -----
