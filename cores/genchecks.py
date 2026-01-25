@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2017  Claire Xenia Wolf <claire@yosyshq.com>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+import os, shutil, re, argparse
+from functools import reduce
+from dataclasses import dataclass, field
+from typing import Any, Tuple, Dict, List, Optional, Set, Union
+
+
+Config = Dict[str, List[Union[str, Tuple[List[str], str]]]]
+
+@dataclass
+class ISAConfig():
+    isa:          str = "rv32i"
+    compr:        bool = False
+    csr_spec:     Optional[str] = None
+
+    nret:         int = 1
+    ilen:         int = 32
+    xlen:         int = 32
+    buslen:       int = 32
+    nbus:         int = 1
+
+    csrs:         Set  = field(default_factory=set)
+    custom_csrs:  Set  = field(default_factory=set)
+    illegal_csrs: Set  = field(default_factory=set)
+    csr_tests:    Dict = field(default_factory=dict)
+
+    def add_csr_tests(self, csr_name: str, test_str: str):
+        # use regex to split by spaces, unless those spaces are inside quotation marks
+        # e.g. const="32'h dead_beef" is one match not two
+        #      const="32'h 0"_mask="32'h dead_beef" is also one match
+        tests = re.findall(r"((?:\S*?\"[^\"]*\")+|\S+)", test_str)
+        self.csr_tests[csr_name] = tests
+
+    def add_csr(self, csr_str: str) -> str:
+        try:
+            (name, tests) = csr_str.split(maxsplit=1)
+            self.add_csr_tests(name, tests)
+        except ValueError: # no tests
+            name = csr_str.strip()
+        self.csrs.add(name)
+        return name
+
+def mask_bits(test: str, bits: List[int], mask_len: int, invert=False) -> str:
+    mask = reduce(lambda x, y: x | 1<<y, bits, 0)
+    fstring = f"{test}_mask={'~' if invert else ''}{mask_len}'b{{:0{mask_len}b}}"
+    return fstring.format(mask)
+
+@dataclass
+class SolverConfig():
+    solver:       str = "boolector"
+    dumpsmt2:     bool = False
+    abspath:      bool = False
+    sbycmd:       str = "sby"
+    mode:         str = "bmc"
+    depths:       List = field(default_factory=list)
+    groups:       List = field(default_factory=lambda: [None])
+    blackbox:     bool = False
+
+
+CFGNAME:  str = "checks"
+BASEDIR:  str = os.path.abspath(f"{os.getcwd()}/..")
+@dataclass
+class PathConfig():
+    corename: str
+    cfgname:  str           = CFGNAME
+    basedir:  str           = BASEDIR
+
+
+def parse_cfg(cfg_path: str) -> Config:
+
+    # config maps section names to lines or tuples of a subsection name and its line
+    config = {}
+
+    print(f"Reading {cfg_path}.cfg.")
+    with open(f"{cfg_path}.cfg", "r") as f:
+        cfgsection = None
+        cfgsubsection = None
+        for line in f:
+            line = line.strip()
+
+            # skip comments
+            if line.startswith("#"):
+                continue
+
+            # enter section/subsection
+            if line.startswith("[") and line.endswith("]"):
+                cfgsection = line.lstrip("[").rstrip("]")
+                cfgsubsection = None
+                if cfgsection.startswith("assume ") or cfgsection == "assume":
+                    cfgsubsection = cfgsection.split()[1:]
+                    cfgsection = "assume"
+                continue
+
+            # append line or subsection + line
+            if cfgsection is not None:
+                if cfgsection not in config:
+                    config[cfgsection] = []
+
+                if cfgsubsection is None:
+                    config[cfgsection].append(line)
+                else:
+                    config[cfgsection].append((cfgsubsection, line))
+
+    return config
+
+
+def extract_options(config: Config) -> Tuple[ISAConfig, SolverConfig]:
+
+    isa_cfg    = ISAConfig()
+    solver_cfg = SolverConfig()
+
+    if "groups" in config:
+        solver_cfg.groups.extend(config["groups"])
+
+    if "options" in config:
+        for line in config["options"]:
+            assert isinstance(line, str)
+            line = line.split()
+
+            if len(line) == 0:
+                continue
+
+            elif line[0] == "nret":
+                assert len(line) == 2
+                isa_cfg.nret = int(line[1])
+
+            elif line[0] == "isa":
+                assert len(line) == 2
+                isa_cfg.isa = line[1]
+
+            elif line[0] == "buslen":
+                assert len(line) == 2
+                isa_cfg.buslen = int(line[1])
+
+            elif line[0] == "nbus":
+                assert len(line) == 2
+                isa_cfg.nbus = int(line[1])
+
+            elif line[0] == "csr_spec":
+                assert len(line) == 2
+                isa_cfg.csr_spec = line[1]
+
+            elif line[0] == "blackbox":
+                assert len(line) == 1
+                solver_cfg.blackbox = True
+
+            elif line[0] == "solver":
+                assert len(line) == 2
+                solver_cfg.solver = line[1]
+
+            elif line[0] == "dumpsmt2":
+                assert len(line) == 1
+                solver_cfg.dumpsmt2 = True
+
+            elif line[0] == "abspath":
+                assert len(line) == 1
+                solver_cfg.abspath = True
+
+            elif line[0] == "mode":
+                assert len(line) == 2
+                assert(line[1] in ("bmc", "prove", "cover"))
+                solver_cfg.mode = line[1]
+
+            else:
+                print(line)
+                assert 0
+
+    if "64" in isa_cfg.isa:
+        isa_cfg.xlen = 64
+
+    if "c" in isa_cfg.isa:
+        isa_cfg.compr = True
+
+    return isa_cfg, solver_cfg
+
+
+def get_depth_cfg(config: Config, patterns: List[str]) -> Optional[List[int]]:
+    ret = None
+    if "depth" in config:
+        for line in config["depth"]:
+            assert isinstance(line, str)
+            line = line.strip().split()
+            if len(line) == 0:
+                continue
+            for pat in patterns:
+                if re.fullmatch(line[0], pat):
+                    ret = [int(s) for s in line[1:]]
+    return ret
+
+def test_disabled(config: Config, check: str) -> bool:
+    if "filter-checks" in config:
+        for line in config["filter-checks"]:
+            assert(isinstance(line, str))
+            line = line.strip().split()
+            if len(line) == 0: continue
+            assert len(line) == 2 and line[0] in ["-", "+"]
+            if re.match(line[1], check):
+                return line[0] == "-"
+    return False
+
+
+def add_all_csrs(config: Config, isa_cfg: ISAConfig):
+    if isa_cfg.csr_spec == "1.12":
+        spec_csrs = {
+            "mvendorid"     : ["const"],
+            "marchid"       : ["const"],
+            "mimpid"        : ["const"],
+            "mhartid"       : ["const"],
+            "mconfigptr"    : ["const"],
+            # All reserved bits should be 0
+            "mstatus"       : [
+                mask_bits(
+                    "zero", 
+                    [0, 2, 4, *range(23, 31)] + ([31, *range(38, 63)] if isa_cfg.xlen==64 else []),
+                    isa_cfg.xlen
+                )
+            ],
+            "misa"          : [
+                mask_bits(
+                    "zero", 
+                    [6, 10, 11, 14, 17, 19, 22, 24, 25, *range(26, isa_cfg.xlen-2)], 
+                    isa_cfg.xlen
+                )
+            ],
+            "mie"           : None,
+            "mtvec"         : None,
+            "mscratch"      : ["any"],
+            "mepc"          : None,
+            "mcause"        : None,
+            "mtval"         : None,
+            "mip"           : None,
+            "mcycle"        : ["inc"],
+            "minstret"      : ["inc"],
+        }
+        spec_csrs.update({f"mhpmcounter{i}" : None for i in range(3, 32)})
+        spec_csrs.update({f"mhpmevent{i}" : None for i in range(3, 32)})
+
+        restricted_csrs = {
+            "medeleg"       : ("s",  "302", None),
+            "mideleg"       : ("s",  "303", None),
+            "mcounteren"    : ("u",  "306", None),
+            "mstatush"      : ("32", "310", [mask_bits("zero", [4, 5], isa_cfg.xlen, invert=True)]),
+            "mtinst"        : ("h",  "34A", None),
+            "mtval2"        : ("h",  "34B", None),
+            "menvcfg"       : ("u",  "30A", None),
+            "menvcfgh"      : ("u",  "31A", None),  # u-mode only *and* 32bit only
+        }
+        for (name, data) in restricted_csrs.items():
+            if data[0] in isa_cfg.isa:
+                spec_csrs[name] = data[2]
+            else:
+                isa_cfg.illegal_csrs.add(
+                    (data[1], "m", "rw"),
+                )
+
+        for (name, tests) in spec_csrs.items():
+            isa_cfg.csrs.add(name)
+            if tests:
+                isa_cfg.csr_tests[name] = tests
+
+    if "csrs" in config:
+        for line in config["csrs"]:
+            assert isinstance(line, str)
+            if line:
+                isa_cfg.add_csr(line)
+
+    if "custom_csrs" in config:
+        for line in config["custom_csrs"]:
+            assert isinstance(line, str)
+            try:
+                (addr, levels, csr_str) = line.split(maxsplit=2)
+            except ValueError: # no csr
+                continue
+            name = isa_cfg.add_csr(csr_str)
+            isa_cfg.custom_csrs.add((name, int(addr, base=16), levels))
+
+    if "illegal_csrs" in config:
+        for line in config["illegal_csrs"]:
+            assert isinstance(line, str)
+            line = tuple(line.split())
+
+            if len(line) == 0:
+                continue
+
+            assert len(line) == 3
+            isa_cfg.illegal_csrs.add(line)
+
+
+def print_custom_csrs(isa_cfg: ISAConfig, sby_file):
+    fstrings = {
+        "inputs": "  ,input [`RISCV_FORMAL_NRET * `RISCV_FORMAL_XLEN - 1 : 0] rvfi_csr_{csr}_{signal} \\",
+        "wires": "  (* keep *) wire [`RISCV_FORMAL_NRET * `RISCV_FORMAL_XLEN - 1 : 0] rvfi_csr_{csr}_{signal}; \\",
+        "conn": "  ,.rvfi_csr_{csr}_{signal} (rvfi_csr_{csr}_{signal}) \\",
+        "channel": "  wire [`RISCV_FORMAL_XLEN - 1 : 0] csr_{csr}_{signal} = rvfi_csr_{csr}_{signal} [(_idx)*(`RISCV_FORMAL_XLEN) +: `RISCV_FORMAL_XLEN]; \\",
+        "signals": "`RISCV_FORMAL_CHANNEL_SIGNAL(`RISCV_FORMAL_NRET, `RISCV_FORMAL_XLEN, csr_{csr}_{signal}) \\",
+        "outputs": "  ,output [`RISCV_FORMAL_NRET * `RISCV_FORMAL_XLEN - 1 : 0] rvfi_csr_{csr}_{signal} \\",
+        "indices": "  localparam [11:0] csr_{level}index_{name} = 12'h{index:03X}; \\"
+    }
+    for (macro, fstring) in fstrings.items():
+        if macro == "channel":
+            print(f"`define RISCV_FORMAL_CUSTOM_CSR_{macro.upper()}(_idx) \\" , file=sby_file)
+        else:
+            print(f"`define RISCV_FORMAL_CUSTOM_CSR_{macro.upper()} \\", file=sby_file)
+        for custom_csr in isa_cfg.custom_csrs:
+            name = custom_csr[0]
+            addr = custom_csr[1]
+            levels = custom_csr[2]
+            if macro == "indices":
+                for level in ["m", "s", "u"]:
+                    if level in levels:
+                        macro_string = fstring.format(level=level, name=name, index=addr)
+                    else:
+                        macro_string = fstring.format(level=level, name=name, index=0xfff)
+                    print(macro_string, file=sby_file)
+            else:
+                for signal in ["rmask", "wmask", "rdata", "wdata"]:
+                    macro_string = fstring.format(csr=name, signal=signal)
+                    print(macro_string, file=sby_file)
+        print("", file=sby_file)
+
+
+
+def init_hargs(config: Config, isa_cfg: ISAConfig, solver_cfg: SolverConfig, path_cfg: PathConfig) -> Dict[str, Any]:
+    hargs = {
+        "basedir" : path_cfg.basedir,
+        "core"    : path_cfg.corename,
+        "nret"    : isa_cfg.nret,
+        "xlen"    : isa_cfg.xlen,
+        "ilen"    : isa_cfg.ilen,
+        "buslen"  : isa_cfg.buslen,
+        "nbus"    : isa_cfg.nbus,
+        "append"  : 0,
+        "mode"    : solver_cfg.mode,
+    }
+
+    if "cover" in config:
+        hargs["cover"] = '\n'.join(config["cover"])
+
+    if solver_cfg.solver == "bmc3":
+        hargs["engine"] = "abc bmc3"
+        hargs["ilang_file"] = f"{path_cfg.corename}-gates.il"
+    elif solver_cfg.solver == "btormc":
+        hargs["engine"] = "btor btormc"
+        hargs["ilang_file"] = f"{path_cfg.corename}-hier.il"
+    else:
+        hargs["engine"] = f"smtbmc {'--dumpsmt2 ' if solver_cfg.dumpsmt2 else ''}{solver_cfg.solver}"
+        hargs["ilang_file"] = f"{path_cfg.corename}-hier.il"
+
+    return hargs
+
+def hfmt(text: Union[str, List[str]], **kwargs):
+    lines = []
+    if isinstance(text, str):
+        text = text.split('\n')
+    for line in text:
+        match = re.match(r"^\s*: ?(.*)", line)
+        if match:
+            line = match.group(1)
+        elif line.strip() == "":
+            continue
+        lines.append(re.sub(r"@([a-zA-Z0-9_]+)@",
+                lambda match: str(kwargs[match.group(1)]), line))
+    return lines
+
+def print_hfmt(f, text, **kwargs):
+    for line in hfmt(text, **kwargs):
+        print(line, file=f)
+
+# ------------------------------ Instruction Checkers ------------------------------
+
+def add_all_check_insn(
+    config: Config, 
+    hargs: Dict[str, Any],
+    isa_cfg: ISAConfig, 
+    solver_cfg: SolverConfig,
+    path_cfg: PathConfig,
+) -> Set[str]:
+
+    checks = []
+
+    isa_file_path = f"{path_cfg.basedir}/insns/isa_{isa_cfg.isa}.txt"
+
+    for grp in solver_cfg.groups:
+        with open(isa_file_path) as isa_file:
+            for insn in isa_file:
+                for chanidx in range(isa_cfg.nret):
+                    checks.append(check_insn(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, insn.strip(), chanidx))
+
+        for csr in sorted(isa_cfg.csrs):
+            for chanidx in range(isa_cfg.nret):
+                checks.append(check_insn(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, csr, chanidx, csr_mode=True))
+
+        for ill_csr in sorted(isa_cfg.illegal_csrs, key=lambda csr: csr[0]):
+            for chanidx in range(isa_cfg.nret):
+                checks.append(check_insn(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, ill_csr, chanidx, illegal_csr=True))
+
+    return set(filter(lambda check: check is not None, checks))
+
+def check_insn(
+    config: Config,
+    hargs: Dict[str, Any],
+    isa_cfg: ISAConfig,
+    solver_cfg: SolverConfig,
+    path_cfg: PathConfig,
+    grp: str,
+    insn: str,
+    chanidx: int,
+    csr_mode=False,
+    illegal_csr=False
+) -> Optional[str]:
+    pf = "" if grp is None else grp+"_"
+    if illegal_csr:
+        (ill_addr, ill_modes, ill_rw) = insn
+        insn = f"12'h{int(ill_addr, base=16):03X}"
+        check = f"{pf}csr_ill_{ill_addr}_ch{chanidx:d}"
+        depth_cfg = get_depth_cfg(config, [f"{pf}csr_ill", f"{pf}csr_ill_ch{chanidx:d}", f"{pf}csr_ill_{ill_addr}", f"{pf}csr_ill_{ill_addr}_ch{chanidx:d}"])
+    else:
+        if csr_mode:
+            check = "csrw"
+        else:
+            check = "insn"
+        depth_cfg = get_depth_cfg(config, [f"{pf}{check}", f"{pf}{check}_ch{chanidx:d}", f"{pf}{check}_{insn}", f"{pf}{check}_{insn}_ch{chanidx:d}"])
+        check = f"{pf}{check}_{insn}_ch{chanidx:d}"
+
+    if depth_cfg is None: return
+    assert len(depth_cfg) == 1
+
+    if test_disabled(config, check):
+        return None
+
+    hargs["insn"] = insn
+    hargs["checkch"] = check
+    hargs["channel"] = f"{chanidx:d}"
+    hargs["depth"] = depth_cfg[0]
+    hargs["depth_plus"] = depth_cfg[0] + 1
+    hargs["skip"] = depth_cfg[0]
+
+    with open(f"{path_cfg.cfgname}/{check}.sby", "w") as sby_file:
+        print_hfmt(sby_file, """
+                : [options]
+                : mode @mode@
+                : expect pass,fail
+                : append @append@
+                : depth @depth_plus@
+                : skip @skip@
+                :
+                : [engines]
+                : @engine@
+                :
+                : [script]
+        """, **hargs)
+
+        if "script-defines" in config:
+            print_hfmt(sby_file, config["script-defines"], **hargs)
+
+        sv_files = [f"{check}.sv"]
+        if "verilog-files" in config:
+            sv_files += hfmt(config["verilog-files"], **hargs)
+
+        vhdl_files = []
+        if "vhdl-files" in config:
+            vhdl_files += hfmt(config["vhdl-files"], **hargs)
+
+        if len(sv_files):
+            print(f"read -sv {' '.join(sv_files)}", file=sby_file)
+
+        if len(vhdl_files):
+            print(f"read -vhdl {' '.join(vhdl_files)}", file=sby_file)
+
+        if "script-sources" in config:
+            print_hfmt(sby_file, config["script-sources"], **hargs)
+
+        print_hfmt(sby_file, """
+                : prep -flatten -nordff -top rvfi_testbench
+        """, **hargs)
+
+        if "script-link" in config:
+            print_hfmt(sby_file, config["script-link"], **hargs)
+
+        print_hfmt(sby_file, """
+                : chformal -early
+                :
+                : [files]
+                : @basedir@/checks/rvfi_macros.vh
+                : @basedir@/checks/rvfi_channel.sv
+                : @basedir@/checks/rvfi_testbench.sv
+        """, **hargs)
+
+        if illegal_csr:
+            print_hfmt(sby_file, """
+                    : @basedir@/checks/rvfi_csr_ill_check.sv
+            """, **hargs)
+        elif csr_mode:
+            print_hfmt(sby_file, """
+                    : @basedir@/checks/rvfi_csrw_check.sv
+            """, **hargs)
+        else:
+            print_hfmt(sby_file, """
+                    : @basedir@/checks/rvfi_insn_check.sv
+                    : @basedir@/insns/insn_@insn@.v
+            """, **hargs)
+
+        print_hfmt(sby_file, """
+                :
+                : [file defines.sv]
+                : `define RISCV_FORMAL
+                : `define RISCV_FORMAL_NRET @nret@
+                : `define RISCV_FORMAL_XLEN @xlen@
+                : `define RISCV_FORMAL_ILEN @ilen@
+                : `define RISCV_FORMAL_RESET_CYCLES 1
+                : `define RISCV_FORMAL_CHECK_CYCLE @depth@
+                : `define RISCV_FORMAL_CHANNEL_IDX @channel@
+        """, **hargs)
+
+        if "assume" in config:
+            print("`define RISCV_FORMAL_ASSUME", file=sby_file)
+
+        if solver_cfg.mode == "prove":
+            print("`define RISCV_FORMAL_UNBOUNDED", file=sby_file)
+
+        for csr in sorted(isa_cfg.csrs):
+            print(f"`define RISCV_FORMAL_CSR_{csr.upper()}", file=sby_file)
+
+        if csr_mode and insn in ("mcycle", "minstret"):
+            print("`define RISCV_FORMAL_CSRWH", file=sby_file)
+
+        if illegal_csr:
+            print_hfmt(sby_file, """
+                    : `define RISCV_FORMAL_CHECKER rvfi_csr_ill_check
+                    : `define RISCV_FORMAL_ILL_CSR_ADDR @insn@
+            """, **hargs)
+            if 'm' in ill_modes:
+                print("`define RISCV_FORMAL_ILL_MMODE", file=sby_file)
+            if 's' in ill_modes:
+                print("`define RISCV_FORMAL_ILL_SMODE", file=sby_file)
+            if 'u' in ill_modes:
+                print("`define RISCV_FORMAL_ILL_UMODE", file=sby_file)
+            if 'r' in ill_rw:
+                print("`define RISCV_FORMAL_ILL_READ", file=sby_file)
+            if 'w' in ill_rw:
+                print("`define RISCV_FORMAL_ILL_WRITE", file=sby_file)
+        elif csr_mode:
+            print_hfmt(sby_file, """
+                    : `define RISCV_FORMAL_CHECKER rvfi_csrw_check
+                    : `define RISCV_FORMAL_CSRW_NAME @insn@
+            """, **hargs)
+        else:
+            print_hfmt(sby_file, """
+                    : `define RISCV_FORMAL_CHECKER rvfi_insn_check
+                    : `define RISCV_FORMAL_INSN_MODEL rvfi_insn_@insn@
+            """, **hargs)
+
+        if isa_cfg.custom_csrs:
+            print_custom_csrs(isa_cfg, sby_file)
+
+        if solver_cfg.blackbox:
+            print("`define RISCV_FORMAL_BLACKBOX_REGS", file=sby_file)
+
+        if isa_cfg.compr:
+            print("`define RISCV_FORMAL_COMPRESSED", file=sby_file)
+
+        if "defines" in config:
+            print_hfmt(sby_file, config["defines"], **hargs)
+
+        print_hfmt(sby_file, """
+                : `include "rvfi_macros.vh"
+                :
+                : [file @checkch@.sv]
+                : `include "defines.sv"
+                : `include "rvfi_channel.sv"
+                : `include "rvfi_testbench.sv"
+        """, **hargs)
+
+        if illegal_csr:
+            print_hfmt(sby_file, """
+                    : `include "rvfi_csr_ill_check.sv"
+            """, **hargs)
+        elif csr_mode:
+            print_hfmt(sby_file, """
+                    : `include "rvfi_csrw_check.sv"
+            """, **hargs)
+        else:
+            print_hfmt(sby_file, """
+                    : `include "rvfi_insn_check.sv"
+                    : `include "insn_@insn@.v"
+            """, **hargs)
+
+        if "assume" in config:
+            print("", file=sby_file)
+            print("[file assume_stmts.vh]", file=sby_file)
+            for pat, line in config["assume"]:
+                enabled = True
+                for p in pat:
+                    if p.startswith("!"):
+                        p = p[1:]
+                        enabled = False
+                    else:
+                        enabled = True
+                    if re.match(p, check):
+                        enabled = not enabled
+                        break
+                if enabled:
+                    print(line, file=sby_file)
+
+        return check
+
+
+
+# ------------------------------ Consistency Checkers ------------------------------
+
+def add_all_consistency_checks(
+    config: Config, 
+    hargs: Dict[str, Any],
+    isa_cfg: ISAConfig, 
+    solver_cfg: SolverConfig,
+    path_cfg: PathConfig,
+) -> Set[str]:
+    checks = []
+
+    for grp in solver_cfg.groups:
+        for i in range(isa_cfg.nret):
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "reg", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "pc_fwd", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "pc_bwd", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "liveness", chanidx=i, start=0, trig=1, depth=2))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "unique", chanidx=i, start=0, trig=1, depth=2))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "causal", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "causal_mem", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "causal_io", chanidx=i, start=0, depth=1))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "ill", chanidx=i, depth=0))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "fault", chanidx=i, depth=0))
+
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_imem", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_imem_fault", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_fault", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_io_read", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_io_read_fault", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_io_write", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_io_write_fault", chanidx=i, start=0, depth=1, bus_mode=True))
+            checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "bus_dmem_io_order", chanidx=i, start=0, depth=1, bus_mode=True))
+
+        checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "hang", start=0, depth=1))
+        checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, "cover", start=0, depth=1))
+
+        for csr in sorted(isa_cfg.csrs):
+            for chanidx in range(isa_cfg.nret):
+                for csr_test in isa_cfg.csr_tests.get(csr, [None]):
+                    checks.append(check_cons(config, hargs, isa_cfg, solver_cfg, path_cfg, grp, csr, chanidx, start=0, depth=1, csr_mode=True, csr_test=csr_test))
+
+    return set(filter(lambda check: check is not None, checks))
+
+
+def check_cons(
+    config: Config,
+    hargs: Dict[str, Any],
+    isa_cfg: ISAConfig,
+    solver_cfg: SolverConfig,
+    path_cfg: PathConfig,
+    grp: str,
+    check: str,
+    chanidx=None,
+    start=None,
+    depth=0,
+    trig=None,
+    csr_mode=False,
+    csr_test=None,
+    bus_mode=False
+) -> Optional[str]:
+
+    pf = "" if grp is None else grp+"_"
+    if csr_mode:
+        csr_name = check
+        if csr_test is not None:
+            # Check for provided mask
+            mask_idx = csr_test.find("_mask")
+            if mask_idx >= 0:
+                try:
+                    csr_mask = str(csr_test[mask_idx:]).split('=', maxsplit=1)[1].strip('"')
+                except IndexError: # no value provided
+                    print(csr_test)
+                    assert 0
+                csr_test = csr_test[:mask_idx]
+            if csr_test.startswith("const"):
+                try:
+                    constval = str(csr_test).split('=', maxsplit=1)[1].strip('"')
+                except IndexError: # no value provided
+                    constval = "rdata_shadow"
+                check = f"{pf}csrc_const_{csr_name}"
+                check_name = f"csrc_const"
+            elif csr_test.startswith("hpm"):
+                try:
+                    hpmevent = str(csr_test).split('=', maxsplit=1)[1].strip('"')
+                except IndexError: # no value provided
+                    pass
+                hpmcounter = str(csr_name).replace("event", "counter")
+                if hpmcounter not in isa_cfg.csrs:
+                    isa_cfg.csrs.add(hpmcounter)
+                check = f"{pf}csrc_hpm_{csr_name}"
+                check_name = f"csrc_hpm"
+            else:
+                check = f"{pf}csrc_{csr_test}_{csr_name}"
+                check_name =f"csrc_{csr_test}"
+
+        else:
+            check = f"{pf}csrc_{csr_name}"
+            check_name = "csrc"
+
+        hargs["check"] = check_name
+
+        if chanidx is not None:
+            depth_cfg = get_depth_cfg(config, [f"{pf}{check_name}", check, f"{pf}{check_name}_ch{chanidx:d}", f"{check}_ch{chanidx:d}"])
+            hargs["channel"] = f"{chanidx:d}"
+            check = f"{check}_ch{chanidx:d}"
+
+        else:
+            depth_cfg = get_depth_cfg(config, [f"{check_name}", check])
+    else:
+        hargs["check"] = check
+        check = pf + check
+
+        if chanidx is not None:
+            depth_cfg = get_depth_cfg(config, [check, f"{check}_ch{chanidx:d}"])
+            hargs["channel"] = f"{chanidx:d}"
+            check = f"{check}_ch{chanidx:d}"
+
+        else:
+            depth_cfg = get_depth_cfg(config, [check])
+
+    if depth_cfg is None: return
+
+    if start is not None:
+        start = depth_cfg[start]
+    else:
+        start = 1
+
+    if trig is not None:
+        trig = depth_cfg[trig]
+
+    if depth is not None:
+        depth = depth_cfg[depth]
+
+    hargs["start"] = start
+    hargs["depth"] = depth
+    hargs["depth_plus"] = depth + 1
+    hargs["skip"] = depth
+
+    hargs["checkch"] = check
+
+    hargs["xmode"] = hargs["mode"]
+    if check == "cover" or "csrc_hpm" in check: hargs["xmode"] = "cover"
+
+    if test_disabled(config, check): 
+        return None
+
+    with open(f"{path_cfg.cfgname}/{check}.sby", "w") as sby_file:
+        print_hfmt(sby_file, """
+                : [options]
+                : mode @xmode@
+                : expect pass,fail
+                : append @append@
+                : depth @depth_plus@
+                : skip @skip@
+                :
+                : [engines]
+                : @engine@
+                :
+                : [script]
+        """, **hargs)
+
+        if "script-defines" in config:
+            print_hfmt(sby_file, config["script-defines"], **hargs)
+
+        if (f"script-defines {hargs['check']}") in config:
+            print_hfmt(sby_file, config[f"script-defines {hargs['check']}"], **hargs)
+
+        sv_files = [f"{check}.sv"]
+        if "verilog-files" in config:
+            sv_files += hfmt(config["verilog-files"], **hargs)
+
+        vhdl_files = []
+        if "vhdl-files" in config:
+            vhdl_files += hfmt(config["vhdl-files"], **hargs)
+
+        if len(sv_files):
+            print(f"read -sv {' '.join(sv_files)}", file=sby_file)
+
+        if len(vhdl_files):
+            print(f"read -vhdl {' '.join(vhdl_files)}", file=sby_file)
+
+        if "script-sources" in config:
+            print_hfmt(sby_file, config["script-sources"], **hargs)
+
+        print_hfmt(sby_file, """
+                : prep -flatten -nordff -top rvfi_testbench
+        """, **hargs)
+
+        if "script-link" in config:
+            print_hfmt(sby_file, config["script-link"], **hargs)
+
+        print_hfmt(sby_file, """
+                : chformal -early
+                :
+                : [files]
+                : @basedir@/checks/rvfi_macros.vh
+                : @basedir@/checks/rvfi_channel.sv
+                : @basedir@/checks/rvfi_testbench.sv
+                : @basedir@/checks/rvfi_@check@_check.sv
+                :
+                : [file defines.sv]
+        """, **hargs)
+
+        print_hfmt(sby_file, """
+                : `define RISCV_FORMAL
+                : `define RISCV_FORMAL_NRET @nret@
+                : `define RISCV_FORMAL_XLEN @xlen@
+                : `define RISCV_FORMAL_ILEN @ilen@
+                : `define RISCV_FORMAL_CHECKER rvfi_@check@_check
+                : `define RISCV_FORMAL_RESET_CYCLES @start@
+                : `define RISCV_FORMAL_CHECK_CYCLE @depth@
+        """, **hargs)
+
+        if "assume" in config:
+            print("`define RISCV_FORMAL_ASSUME", file=sby_file)
+
+        if solver_cfg.mode == "prove":
+            print("`define RISCV_FORMAL_UNBOUNDED", file=sby_file)
+
+        for csr in sorted(isa_cfg.csrs):
+            print(f"`define RISCV_FORMAL_CSR_{csr.upper()}", file=sby_file)
+
+        if csr_mode:
+            localdict = locals()
+            csr_defs = [
+                ("RISCV_FORMAL_CSRC_CONSTVAL", "constval"),
+                ("RISCV_FORMAL_CSRC_HPMEVENT", "hpmevent"),
+                ("RISCV_FORMAL_CSRC_HPMCOUNTER", "hpmcounter"),
+                ("RISCV_FORMAL_CSRC_MASK", "csr_mask"),
+            ]
+            for key, val  in csr_defs:
+                try:
+                    print(f"`define {key} {localdict[val]}", file=sby_file)
+                except KeyError:
+                    # no val for key
+                    pass
+            print(f"`define RISCV_FORMAL_CSRC_NAME {csr_name}", file=sby_file)
+
+        if isa_cfg.custom_csrs:
+            print_custom_csrs(isa_cfg, sby_file)
+
+        if solver_cfg.blackbox and hargs["check"] != "liveness":
+            print("`define RISCV_FORMAL_BLACKBOX_ALU", file=sby_file)
+
+        if solver_cfg.blackbox and hargs["check"] != "reg":
+            print("`define RISCV_FORMAL_BLACKBOX_REGS", file=sby_file)
+
+        if chanidx is not None:
+            print(f"`define RISCV_FORMAL_CHANNEL_IDX {chanidx:d}", file=sby_file)
+
+        if trig is not None:
+            print(f"`define RISCV_FORMAL_TRIG_CYCLE {trig:d}", file=sby_file)
+
+        if bus_mode:
+            print_hfmt(sby_file, """
+                    : `define RISCV_FORMAL_BUS
+                    : `define RISCV_FORMAL_NBUS @nbus@
+                    : `define RISCV_FORMAL_BUSLEN @buslen@
+            """, **hargs)
+
+        if hargs["check"] in ("liveness", "hang"):
+            print("`define RISCV_FORMAL_FAIRNESS", file=sby_file)
+
+        if "defines" in config:
+            print_hfmt(sby_file, config["defines"], **hargs)
+
+        if (f"defines {hargs['check']}") in config:
+            print_hfmt(sby_file, config[f"defines {hargs['check']}"], **hargs)
+
+        print_hfmt(sby_file, """
+                : `include "rvfi_macros.vh"
+                :
+                : [file @checkch@.sv]
+                : `include "defines.sv"
+                : `include "rvfi_channel.sv"
+                : `include "rvfi_testbench.sv"
+                : `include "rvfi_@check@_check.sv"
+        """, **hargs)
+
+        if check == pf+"cover":
+            print_hfmt(sby_file, """
+                    :
+                    : [file cover_stmts.vh]
+                    : @cover@
+            """, **hargs)
+
+        if "assume" in config:
+            print("", file=sby_file)
+            print("[file assume_stmts.vh]", file=sby_file)
+            for pat, line in config["assume"]:
+                enabled = True
+                for p in pat:
+                    if p.startswith("!"):
+                        p = p[1:]
+                        enabled = False
+                    else:
+                        enabled = True
+                    if re.match(p, check):
+                        enabled = not enabled
+                        break
+                if enabled:
+                    print(line, file=sby_file)
+
+    return check
+
+
+# ------------------------------ Makefile ------------------------------
+
+def create_makefile(config: Config, solver_cfg: SolverConfig, path_cfg: PathConfig, cons_checks: Set[str], inst_checks: Set[str]):
+    with open(f"{path_cfg.cfgname}/makefile", "w") as mkfile:
+        print("all:", end="", file=mkfile)
+
+        checks = list(sorted(cons_checks | inst_checks, key=lambda check: checks_key(config, check)))
+
+        for check in checks:
+            print(f" {check}", end="", file=mkfile)
+        print(file=mkfile)
+
+        for check in checks:
+            print(f"{check}: {check}/status", file=mkfile)
+            print(f"{check}/status:", file=mkfile)
+            if solver_cfg.abspath:
+                print(f"\t{solver_cfg.sbycmd} $(shell pwd)/{check}.sby", file=mkfile)
+            else:
+                print(f"\t{solver_cfg.sbycmd} {check}.sby", file=mkfile)
+            print(f".PHONY: {check}", file=mkfile)
+
+
+def checks_key(config: Config, check: str) -> str:
+    if "sort" in config:
+        for index, line in enumerate(config["sort"]):
+            assert isinstance(line, str)
+            if re.fullmatch(line.strip(), check):
+                return f"{index:04d}-{check}"
+    if check.startswith("insn_"):
+        return f"9999-{check}"
+    return f"9998-{check}"
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        prog="genchecks",
+        description="generates all sby checks for riscv-formal",
+    )
+    parser.add_argument(
+        "--corename",
+        required=True,
+        type=str,
+        help=f"Core name used by rvfi when generating checks. Should match the subdirectory inside the 'cores' folder",
+    )
+    parser.add_argument(
+        "--cfgname",
+        type=str,
+        help=f"name of the relative path to the destination directory [Default = {CFGNAME}]",
+    )
+    parser.add_argument(
+        "--basedir",
+        type=str,
+        help=f"path to all checks in the rvfi library [Default = {BASEDIR}]",
+    )
+    args = parser.parse_args()
+    path = PathConfig(args.corename)
+    if args.cfgname:
+        path.cfgname  = args.cfgname
+    if args.basedir:
+        path.basedir  = args.basedir
+
+    print(f"Entering {path.corename} directory")
+    os.chdir(os.path.abspath(path.corename))
+
+    print(f"Creating {path.cfgname} directory.")
+    shutil.rmtree(path.cfgname, ignore_errors=True)
+    os.mkdir(path.cfgname)
+
+    config = parse_cfg(path.cfgname)
+    isa_cfg, solver_cfg = extract_options(config)
+    add_all_csrs(config, isa_cfg)
+    hargs = init_hargs(config, isa_cfg, solver_cfg, path)
+
+    inst_checks = add_all_check_insn(config, hargs, isa_cfg, solver_cfg, path)
+    cons_checks = add_all_consistency_checks(config, hargs, isa_cfg, solver_cfg, path)
+
+    create_makefile(config, solver_cfg, path, cons_checks, inst_checks)
+
+    print(f"Generated {len(cons_checks) + len(inst_checks)} checks.")
