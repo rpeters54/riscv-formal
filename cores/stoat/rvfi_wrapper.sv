@@ -39,7 +39,8 @@ module rvfi_wrapper (
     (* keep *) wire               [31:0] w_dbus_addr;
     (* keep *) wire               [31:0] w_dbus_data_mosi;
 
-    (* keep *) wire                      w_full_flush;
+    (* keep *) wire                      w_imem_flush;
+    (* keep *) wire                      w_dmem_flush;
 
     stoat_mcu # (
         .RESET_VEC('0)
@@ -62,7 +63,8 @@ module rvfi_wrapper (
 
     `undef CSR_MACRO_OP
 
-        .o_full_flush       (w_full_flush),
+        .o_imem_flush       (w_imem_flush),
+        .o_dmem_flush       (w_dmem_flush),
 
         //=============================//
         // IMEM read-only wishbone bus port
@@ -120,11 +122,16 @@ module rvfi_wrapper (
 
 
     always @(posedge i_clk) begin
-        if (w_full_flush) begin
+        if (w_imem_flush) begin
             w_ibus_pending_count <= 0;
-            w_dbus_pending_count <= 0;
         end else begin
             w_ibus_pending_count <= $signed(w_ibus_pending_count_next) >= 0 ? w_ibus_pending_count_next : 0;
+        end
+    end
+    always @(posedge i_clk) begin
+        if (w_dmem_flush) begin
+            w_dbus_pending_count <= 0;
+        end else begin
             w_dbus_pending_count <= $signed(w_dbus_pending_count_next) >= 0 ? w_dbus_pending_count_next : 0;
         end
     end
