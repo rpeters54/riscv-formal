@@ -23,7 +23,7 @@ cd stoat
 make -C checks -j(nprocs)
 ```
 
-BUGS FOUND:
+Bugs Found:
 -----------
 
 ### OtterMCU:
@@ -45,8 +45,12 @@ The `cores/example` directory includes a set of files to attach the riscv-formal
 Begin by copying your verilog source files into the `cores/example/rtl` directory.
 In the top-module of your core (e.g. `otter_mcu.v` or something similar), instantiate the `otter_rvfi.v` module.
 The purpose of each input to the `otter_rvfi.v` module are documented inside it.
+
 ```verilog
+
+    //=========================//
     // INSIDE YOUR TOP MODULE:
+    //=========================//
 
     //----------------------------------------------------------------------------//
     // RISC-V Formal Interface: Set of Bindings Used in Sim to Verify Correctness
@@ -55,38 +59,37 @@ The purpose of each input to the `otter_rvfi.v` module are documented inside it.
 `ifdef RISCV_FORMAL
 
     otter_rvfi u_otter_rvfi (
-        .i_clk             (i_clk),
-        .i_rst             (i_rst),
-        .i_stall           (w_stall),
-        .i_valid           (w_valid),
-        .i_excp            (w_excp),
-        .i_trap            (w_trap),
+        .i_clk             (/* clk signal */),
+        .i_rst             (/* active-high reset */),
+        .i_valid           (/* valid signal (1 if a new instruction will be fetched next cycle) */),
+        .i_excp            (/* 1 if an interrupt occurs this cycle */),
+        .i_trap            (/* 1 if a synchronous trap occurs this cycle */),
 
-        .i_instrn          (w_instrn),
+        .i_instrn          (/* instruction signal */),
 
-        .i_is_reg_type     (w_is_reg_type),
-        .i_is_imm_type     (w_is_imm_type),
-        .i_is_load         (w_is_load),
-        .i_is_store        (w_is_store),
-        .i_is_branch       (w_is_branch),
-        .i_is_jal          (w_is_jal),
-        .i_is_jalr         (w_is_jalr),
-        .i_is_csr_write    (w_is_csr_write),
+        .i_is_reg_type     (/* add, sub, etc. */),
+        .i_is_imm_type     (/* addi, slti, etc. */),
+        .i_is_load         (/* lb, lh, lw, etc. */),
+        .i_is_store        (/* sb, sh, sw */),
+        .i_is_branch       (/* beq, bnez, etc. */),
+        .i_is_jal          (/* jal */),
+        .i_is_jalr         (/* jalr */),
+        .i_is_csr_write    (/* csrrw (can be wired zero if unimplemented) */),
 
-        .i_br_taken        (w_br_taken),
-        .i_pc_addr         (w_pc_addr),
-        .i_br_tgt_addr     (w_br_tgt_addr),
-        .i_epc_addr        (w_epc_addr),
+        .i_br_taken        (/* 1 if branch taken */),
+        .i_pc_addr         (/* current pc address */),
+        .i_br_tgt_addr     (/* jump/branch instruction target address */),
+        .i_epc_addr        (/* exception address, mepc or mtvec depending on type */),
 
-        .i_rfile_we        (w_rfile_we),
-        .i_rfile_w_data    (w_rfile_w_data),
-        .i_rfile_r_rs1     (w_rfile_r_rs1),
-        .i_rfile_r_rs2     (w_rfile_r_rs2),
+        .i_rfile_we        (/* rfile write-enable */),
+        .i_rfile_w_data    (/* rfile write data */),
+        .i_rfile_r_rs1     (/* rfile rs1 read data */),
+        .i_rfile_r_rs2     (/* rfile rs2 read data */),
 
-        .i_dmem_sel        (o_dmem_sel),
-        .i_dmem_addr       (o_dmem_addr),
-        .i_dmem_r_data     (i_dmem_r_data),
-        .i_dmem_w_data     (o_dmem_w_data),
+        .i_dmem_sel        (/* byte mask for data memory */),
+        .i_dmem_addr       (/* address read from/written to in dmem */),
+        .i_dmem_r_data     (/* data read from dmem */),
+        .i_dmem_w_data     (/* data written to dmem */),
 
         `RVFI_INTERCONNECTS
         ._dummy(1'b0)
@@ -97,8 +100,13 @@ The purpose of each input to the `otter_rvfi.v` module are documented inside it.
 ```
 
 Once added, use the `RVFI_OUTPUTS` macro to add the the RVFI signals to the outputs of your top module.
+
 ```verilog
+
+//=================================================//
 // YOUR TOP MODULE SHOULD LOOK SOMETHING LIKE THIS
+//=================================================//
+
 `include "rvfi_defines.vh"
 
 module otter_mcu #(
@@ -125,8 +133,13 @@ module otter_mcu #(
 ```
 
 Inside `rvfi_wrapper.sv`, update the mcu instantiation to match the name and signals used by your core.
+
 ```verilog
+
+//=================================//
 // UPDATE THIS TO MATCH YOUR CORE:
+//=================================//
+
 (* keep *) `rvformal_rand_reg [31:0] w_intrpt;
 (* keep *) `rvformal_rand_reg [31:0] w_imem_r_data;
 (* keep *) `rvformal_rand_reg [31:0] w_dmem_r_data;
@@ -160,6 +173,7 @@ otter_mcu # (
 ```
 
 With those additions, use `genchecks.py` to generate the checks for the core, and try running the checks with `make`.
+
 ```bash
 # Enter the cores directory
 cd cores
@@ -168,6 +182,33 @@ cd cores
 cd example
 make -C checks -j(nprocs)
 ```
+
+Dicussion
+---------
+
+After getting the checks running, look at the counterexample waveforms for at least three failing tests
+
+For each, include a screenshot of the counterexample and discuss:
+
+1. What assertion in the check failed; what is it testing for?
+2. What behavior caused the failing example, was it a misinterpretation of the spec, wiring issue, etc.?
+3. What changes do you think would fix the issue, and why?
+
+*Note: if you are lucky enough to not fail three checks, you may introduce a bug into one of your modules and discuss the check that detects the fault.*
+
+Deliverables
+------------
+
+Please include the following in your submission:
+
+1. Your modified verilog file that instantiates and connects to the `otter_rvfi`.
+2. The updated `rvfi_wrapper.sv` that connects to your core
+3. A separate `.pdf` that contains your responses to the discussion questions.
+
+
+END OF CHANGES
+==============
+
 
 About
 -----
